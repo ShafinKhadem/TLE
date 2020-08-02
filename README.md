@@ -88,6 +88,8 @@ To start TLE just run:
 ./run.sh
 ```
 
+Read [here](heroku_deploy.md) how to depoly it on [Heroku](https://www.heroku.com/).
+
 ### Notes
 
 - In order to run admin-only commands, you need to have the `Admin` role, which needs to be created in your Discord server and assign it to yourself/other administrators.
