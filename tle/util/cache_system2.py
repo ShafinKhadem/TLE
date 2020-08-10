@@ -33,7 +33,7 @@ class ContestNotFound(ContestCacheError):
 class ContestCache:
     _NORMAL_CONTEST_RELOAD_DELAY = 30 * 60
     _EXCEPTION_CONTEST_RELOAD_DELAY = 5 * 60
-    _ACTIVE_CONTEST_RELOAD_DELAY = 5 * 60
+    _ACTIVE_CONTEST_RELOAD_DELAY = 20 * 60
     _ACTIVATE_BEFORE = 20 * 60
 
     _RUNNING_PHASES = ('CODING', 'PENDING_SYSTEM_TEST', 'SYSTEM_TEST')
@@ -357,10 +357,13 @@ class ProblemsetCache:
 class RatingChangesCache:
     _RATED_DELAY = 36 * 60 * 60
     _RELOAD_DELAY = 10 * 60
+    _ROLLBACK_DELAY = 72 * 60 * 60
+    _ROLLBACK_RELOAD_DELAY = 6 * 60 * 60
 
     def __init__(self, cache_master):
         self.cache_master = cache_master
         self.monitored_contests = []
+        self.recent_rated_contests = []
         self.handle_rating_cache = {}
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -369,7 +372,7 @@ class RatingChangesCache:
         if not self.handle_rating_cache:
             self.logger.warning('Rating changes cache on disk is empty. This must be populated '
                                 'manually before use.')
-        self._update_task.start()
+        # self._update_task.start() # Update this cache manually (handling rollback takes too much time)
 
     async def fetch_contest(self, contest_id):
         """Fetch rating changes for a particular contest. Intended for manual trigger."""
@@ -406,6 +409,12 @@ class RatingChangesCache:
                 now - contest.end_time < self._RATED_DELAY and
                 not self.has_rating_changes_saved(contest.id))
 
+    def is_newly_finished_with_rating_changes(self, contest):
+        now = time.time()
+        return (contest.phase == 'FINISHED' and
+                now - contest.end_time < self._ROLLBACK_DELAY and
+                self.has_rating_changes_saved(contest.id))
+
     @tasks.task_spec(name='RatingChangesCacheUpdate',
                      waiter=tasks.Waiter.for_event(events.ContestListRefresh))
     async def _update_task(self, _):
@@ -428,6 +437,18 @@ class RatingChangesCache:
             else:
                 self.monitored_contests = []
 
+        to_monitor_rollback = [contest for contest in self.cache_master.contest_cache.contests_by_phase['FINISHED']
+                                if self.is_newly_finished_with_rating_changes(contest)]
+        cur_ids = {contest.id for contest in self.recent_rated_contests}
+        new_ids = {contest.id for contest in to_monitor_rollback}
+        if new_ids != cur_ids:
+            await self._monitor_rollback_task.stop()
+            if to_monitor_rollback:
+                self.recent_rated_contests = to_monitor_rollback
+                self._monitor_rollback_task.start()
+            else:
+                self.recent_rated_contests = []
+
     @tasks.task_spec(name='RatingChangesCacheUpdate.MonitorNewlyFinishedContests',
                      waiter=tasks.Waiter.fixed_delay(_RELOAD_DELAY))
     async def _monitor_task(self, _):
@@ -439,6 +460,27 @@ class RatingChangesCache:
             return
 
         contest_changes_pairs = await self._fetch(self.monitored_contests)
+        # Sort by the rating update time of the first change in the list of changes, assuming
+        # every change in the list has the same time.
+        contest_changes_pairs.sort(key=lambda pair: pair[1][0].ratingUpdateTimeSeconds)
+        self._save_changes(contest_changes_pairs)
+        for contest, changes in contest_changes_pairs:
+            cf_common.event_sys.dispatch(events.RatingChangesUpdate, contest=contest,
+                                         rating_changes=changes)
+
+    @tasks.task_spec(name='RatingChangesCacheUpdate.MonitorRecentRatedContests',
+                     waiter=tasks.Waiter.fixed_delay(_ROLLBACK_RELOAD_DELAY))
+    async def _monitor_rollback_task(self, _):
+        self.recent_rated_contests = [contest for contest in self.recent_rated_contests
+                                        if self.is_newly_finished_with_rating_changes(contest)]
+        if not self.recent_rated_contests:
+            self.logger.info('Rating changes fetched for contests that were being monitored for rollback.')
+            await self._monitor_rollback_task.stop()
+            return
+
+        contest_changes_pairs = await self._fetch(self.recent_rated_contests)
+        for contest, _ in contest_changes_pairs:
+            self.cache_master.conn.clear_rating_changes(contest_id=contest.id)
         # Sort by the rating update time of the first change in the list of changes, assuming
         # every change in the list has the same time.
         contest_changes_pairs.sort(key=lambda pair: pair[1][0].ratingUpdateTimeSeconds)
@@ -675,4 +717,3 @@ class CacheSystem:
         users_effective_rating_dict = {user.handle: user.effective_rating
                                   for user in ratedList}
         return users_effective_rating_dict
-
